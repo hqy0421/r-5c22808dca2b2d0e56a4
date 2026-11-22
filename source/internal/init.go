@@ -23,6 +23,13 @@ import (
 // Init creates a replication slot, snapshots all discovered tables to base
 // Parquet files, and writes a manifest.json. This follows the native
 // Postgres replica pattern: snapshot + LSN = zero-gap starting point.
+//
+// Tables are read in bounded primary-key keyset batches against the slot's
+// exported snapshot (see SnapshotConfig); each batch becomes one numbered
+// base segment. The manifest is the single atomic publish point — segments
+// written by an interrupted run stay invisible without it and are cleaned up
+// on the next attempt, while tables already present in an existing manifest
+// are carried over untouched so their incremental state stays valid.
 func Init(ctx context.Context, cfg config.Config, source ports.Source, sink ports.Sink) error {
 	defer source.Close()
 
@@ -115,18 +122,28 @@ func Init(ctx context.Context, cfg config.Config, source ports.Source, sink port
 	// Release the snapshot-holding replication connection after all copies.
 	defer source.ReleaseSnapshot(ctx)
 
+	// Snapshot each table using the exported snapshot. Tables already present
+	// in an existing manifest are considered published and protected: their
+	// base segments, delta epochs and schema are carried over untouched, so
+	// re-running init never invalidates a running deployment's incremental
+	// state. Base files left by an interrupted earlier init run (no manifest
+	// entry) are stale and cleaned before re-writing.
+	// A missing manifest means a fresh deployment (every sink surfaces that as
+	// an error here). A real read failure is only warned about: init remains
+	// runnable, but the operator gets a signal that published-table protection
+	// could not be evaluated rather than having it silently disabled.
+	existingManifest, manifestErr := sink.ReadManifest(ctx)
+	if manifestErr != nil {
+		fmt.Printf("  warning: could not read existing manifest (%v); treating all tables as new\n", manifestErr)
+		existingManifest = nil
+	}
+
 	// Snapshot each table using the exported snapshot
 	manifestTables := make(map[string]manifest.Table)
 	manifestSchemas := make(map[string]manifest.Schema)
+	carriedOver := 0
 
 	for _, t := range tables {
-		fmt.Printf("  snapshot: %s ...", t.qualified)
-
-		rows, _, err := source.CopyTable(ctx, t.schema, t.name, snapshot.SnapshotName)
-		if err != nil {
-			return fmt.Errorf("copy %s: %w", t.qualified, err)
-		}
-
 		// Build manifest columns
 		var mCols []manifest.Column
 		for _, col := range t.cols {
@@ -138,19 +155,33 @@ func Init(ctx context.Context, cfg config.Config, source ports.Source, sink port
 			})
 		}
 
-		// Write base Parquet
-		basePath := filepath.Join(t.qualified, "base", "base_000000.parquet")
-		tmpPath := filepath.Join("/tmp", "pgcdc-init", basePath)
-		if err := writer.WriteBaseParquet(tmpPath, rows, mCols); err != nil {
-			fmt.Printf(" (parquet write failed: %v, writing raw)\n", err)
+		if existing, ok := existingManifestTable(existingManifest, t.qualified); ok {
+			// Already published: keep its base/delta state and schema exactly
+			// as consumers and `start` know them; do not re-read Postgres or
+			// touch its base files.
+			carriedOver++
+			fmt.Printf("  snapshot: %s skipped (already published, base epoch %d)\n", t.qualified, existing.BaseEpoch)
+			manifestTables[t.qualified] = existing
+			if schema, ok := existingManifest.Schemas[t.qualified]; ok {
+				manifestSchemas[t.qualified] = schema
+			} else {
+				manifestSchemas[t.qualified] = manifest.Schema{Version: 1, Columns: mCols}
+			}
+			continue
 		}
 
-		// Upload to storage via sink
-		if err := uploadFile(ctx, sink, basePath, tmpPath); err != nil {
-			return fmt.Errorf("upload %s: %w", basePath, err)
+		fmt.Printf("  snapshot: %s ...\n", t.qualified)
+
+		if err := cleanupStaleBaseSegments(ctx, sink, t.qualified); err != nil {
+			return fmt.Errorf("cleanup stale base for %s: %w", t.qualified, err)
 		}
 
-		fmt.Printf(" %d rows\n", len(rows))
+		rowCount, segments, err := snapshotTableBatches(ctx, cfg.Snapshot.BatchSize(), source, sink, t, snapshot.SnapshotName, mCols)
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("  snapshot: %s done (%d rows, %d segment(s))\n", t.qualified, rowCount, segments)
 
 		manifestTables[t.qualified] = manifest.Table{
 			Status:           "active",
@@ -159,7 +190,7 @@ func Init(ctx context.Context, cfg config.Config, source ports.Source, sink port
 			SchemaVersion:    1,
 			BaseEpoch:        0,
 			LatestDeltaEpoch: 0,
-			RowCount:         int64(len(rows)),
+			RowCount:         rowCount,
 			Path:             t.qualified,
 		}
 		manifestSchemas[t.qualified] = manifest.Schema{
@@ -190,15 +221,27 @@ func Init(ctx context.Context, cfg config.Config, source ports.Source, sink port
 		}
 	}
 
-	// Write manifest
+	// Write manifest. When any table was carried over from an existing
+	// deployment, keep that deployment's Source anchor: its base files were
+	// snapshotted at the original InitLSN and `start` resumes from there, so
+	// rewriting the anchor to the freshly created slot's LSN would open a gap.
+	// New tables added in this run are snapshot at the new slot and begin
+	// streaming at that same point, so they stay zero-gap on their own.
+	sourceBlock := manifest.Source{
+		Name:            slotName,
+		PostgresVersion: truncateVersion(pgVersion),
+		InitLSN:         snapshot.LSN,
+		InitTimestamp:   time.Now().UTC(),
+	}
+	if carriedOver > 0 && existingManifest != nil {
+		sourceBlock = existingManifest.Source
+		fmt.Printf("  keeping incremental anchor at LSN %s for %d carried-over table(s)\n",
+			sourceBlock.InitLSN, carriedOver)
+	}
+
 	m := &manifest.Manifest{
-		Version: 1,
-		Source: manifest.Source{
-			Name:            slotName,
-			PostgresVersion: truncateVersion(pgVersion),
-			InitLSN:         snapshot.LSN,
-			InitTimestamp:    time.Now().UTC(),
-		},
+		Version:   1,
+		Source:    sourceBlock,
 		Tables:    manifestTables,
 		Schemas:   manifestSchemas,
 		Roles:     roles,
@@ -215,7 +258,10 @@ func Init(ctx context.Context, cfg config.Config, source ports.Source, sink port
 
 	fmt.Printf("\nInit complete:\n")
 	fmt.Printf("  Slot: %s\n", slotName)
-	fmt.Printf("  LSN: %s\n", snapshot.LSN)
+	fmt.Printf("  LSN: %s\n", sourceBlock.InitLSN)
+	if carriedOver > 0 {
+		fmt.Printf("  (new slot consistent point %s; streaming anchor kept at %s)\n", snapshot.LSN, sourceBlock.InitLSN)
+	}
 	fmt.Printf("  Tables: %d\n", len(tables))
 	fmt.Printf("  Epoch: %s\n", epoch.FormatFilename(0))
 	fmt.Printf("  Storage: %s (%s)\n", cfg.Storage.Path, sink.Backend())
@@ -295,6 +341,99 @@ func uploadFile(ctx context.Context, sink ports.Sink, remotePath, localPath stri
 	}
 	defer func() { _ = f.Close() }()
 	return sink.WriteFile(ctx, remotePath, f)
+}
+
+// initTmpRoot is the local scratch directory for base segments before they
+// are published through the sink. Each table gets a unique subdirectory so
+// interrupted runs never mix segments across attempts.
+const initTmpRoot = "/tmp/pgcdc-init"
+
+// baseSegmentPath returns the storage-relative path of one init base segment.
+// Init always writes epoch 0; compaction later writes a single base_<epoch>.
+func baseSegmentPath(qualified string, part int) string {
+	return filepath.Join(qualified, "base", fmt.Sprintf("base_000000_part_%06d.parquet", part))
+}
+
+// existingManifestTable returns the active manifest entry of a table that has
+// already been published, so a re-run of init can carry it over instead of
+// re-snapshotting it and resetting its base/delta state. A nil manifest (fresh
+// deployment) or a non-active entry yields ok=false.
+func existingManifestTable(m *manifest.Manifest, qualified string) (manifest.Table, bool) {
+	if m == nil {
+		return manifest.Table{}, false
+	}
+	t, ok := m.Tables[qualified]
+	if !ok || t.Status != "active" {
+		return manifest.Table{}, false
+	}
+	return t, true
+}
+
+// cleanupStaleBaseSegments removes base files left under a table path by an
+// earlier init attempt that never published a manifest. Deterministic segment
+// names mean a successful re-run would overwrite them anyway; deleting first
+// also covers segment-count changes between runs (e.g. batch size tuning).
+func cleanupStaleBaseSegments(ctx context.Context, sink ports.Sink, qualified string) error {
+	basePrefix := filepath.Join(qualified, "base") + "/"
+	files, err := sink.ListFiles(ctx, basePrefix)
+	if err != nil {
+		return fmt.Errorf("list base segments: %w", err)
+	}
+	for _, f := range files {
+		if err := sink.DeleteFile(ctx, f); err != nil {
+			return fmt.Errorf("delete stale segment %s: %w", f, err)
+		}
+	}
+	return nil
+}
+
+// snapshotTableBatches reads one table through the exported snapshot in
+// bounded keyset batches and writes one base Parquet segment per batch.
+// Segments are published to storage as they complete, but the table only
+// becomes visible to readers (compaction, MCP views, streaming) when the
+// manifest referencing it is written afterwards — that final manifest write
+// is the atomic publish point. It returns the total row count and number of
+// segments written (at least one, even for an empty table).
+func snapshotTableBatches(
+	ctx context.Context,
+	batchSize int,
+	source ports.Source,
+	sink ports.Sink,
+	t tableInfo,
+	snapshotName string,
+	mCols []manifest.Column,
+) (totalRows int64, segments int, err error) {
+	if err := os.MkdirAll(initTmpRoot, 0o755); err != nil {
+		return 0, 0, fmt.Errorf("create temp root for %s: %w", t.qualified, err)
+	}
+	tmpDir, err := os.MkdirTemp(initTmpRoot, strings.ReplaceAll(t.qualified, ".", "_")+"-*")
+	if err != nil {
+		return 0, 0, fmt.Errorf("create temp dir for %s: %w", t.qualified, err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	part := 0
+	scanErr := source.ScanTable(ctx, t.schema, t.name, snapshotName, t.pks, batchSize, func(batch []map[string]any) error {
+		remotePath := baseSegmentPath(t.qualified, part)
+		tmpPath := filepath.Join(tmpDir, fmt.Sprintf("part_%06d.parquet", part))
+
+		if writeErr := writer.WriteBaseParquet(tmpPath, batch, mCols); writeErr != nil {
+			return fmt.Errorf("write base segment %s: %w", remotePath, writeErr)
+		}
+		if uploadErr := uploadFile(ctx, sink, remotePath, tmpPath); uploadErr != nil {
+			return fmt.Errorf("upload %s: %w", remotePath, uploadErr)
+		}
+
+		totalRows += int64(len(batch))
+		segments++
+		part++
+		fmt.Printf("    %s: segment %d (%d rows, %d total)\n", t.qualified, part, len(batch), totalRows)
+		return nil
+	})
+	if scanErr != nil {
+		return 0, 0, fmt.Errorf("snapshot %s: %w", t.qualified, scanErr)
+	}
+	return totalRows, segments, nil
 }
 
 type tableInfo struct {

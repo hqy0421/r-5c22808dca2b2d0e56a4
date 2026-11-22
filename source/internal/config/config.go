@@ -7,6 +7,7 @@ type Config struct {
 	Storage     StorageConfig     `yaml:"storage"`
 	Replication ReplicationConfig `yaml:"replication"`
 	Flush       FlushConfig       `yaml:"flush"`
+	Snapshot    SnapshotConfig    `yaml:"snapshot"`
 	Tables      TablesConfig      `yaml:"tables"`
 	Profiles    ProfilesConfig    `yaml:"profiles"`
 	State       StateConfig       `yaml:"state"`
@@ -54,6 +55,24 @@ type ReplicationConfig struct {
 type FlushConfig struct {
 	IntervalSec int `yaml:"interval_sec"`
 	MaxRows     int `yaml:"max_rows"`
+}
+
+// SnapshotConfig holds the bounded-batch settings used by `init` when reading
+// an exported snapshot out of PostgreSQL. Instead of loading a whole table
+// into memory, init pages through the table in BatchRows-sized keyset batches
+// and writes one base Parquet segment per batch.
+type SnapshotConfig struct {
+	// BatchRows bounds the number of rows held in memory per snapshot read.
+	// Defaults to 50000 when unset or non-positive.
+	BatchRows int `yaml:"batch_rows"`
+}
+
+// BatchSize returns the configured batch size with the default applied.
+func (c SnapshotConfig) BatchSize() int {
+	if c.BatchRows <= 0 {
+		return 50000
+	}
+	return c.BatchRows
 }
 
 // TablesConfig holds table filtering and tagging settings.

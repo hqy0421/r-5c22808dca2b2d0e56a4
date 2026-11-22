@@ -35,7 +35,7 @@ First-class support for managed Postgres alongside self-managed, behind the same
 ### Initial consistent snapshot
 Captures every active table's contents at a single LSN before streaming begins, so consumers see a clean base + replayable deltas.
 - [x] `pg-cdc init` exports a snapshot via `CREATE_REPLICATION_SLOT`
-- [x] Per-table COPY runs against `SET TRANSACTION SNAPSHOT` for consistency
+- [x] Bounded keyset batches run against `SET TRANSACTION SNAPSHOT` for consistency — memory is capped at `snapshot.batch_rows`, with one numbered base segment per batch
 - [x] Cross-table parallel snapshot via `init.parallel_workers` (default 4) — Phase 8 #4a
 - [x] Iceberg `CreateTable` registered inline alongside parquet base files
 

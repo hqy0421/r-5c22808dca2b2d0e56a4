@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
 	"time"
 
 	"github.com/burnside-project/burnside-go/epoch"
@@ -173,16 +176,54 @@ func compactTable(ctx context.Context, sink ports.Sink, m *manifest.Manifest, ta
 	return nil
 }
 
+// baseEpochPattern matches base Parquet files produced either by init
+// ("base_000000_part_000003.parquet") or compaction ("base_000042.parquet").
+var baseEpochPattern = regexp.MustCompile(`^base_(\d{6})(?:_part_\d{6})?\.parquet$`)
+
+// readBase reads every segment of the table's latest base epoch. Init writes
+// one segment per bounded snapshot batch (all at epoch 0); compaction writes
+// a single base_<epoch>.parquet. Files are sorted by path so init segments
+// come back in the same order the keyset scan emitted them.
 func readBase(ctx context.Context, sink ports.Sink, table manifest.Table) ([]writer.Row, error) {
 	basePath := table.Path + "/base/"
 	files, err := sink.ListFiles(ctx, basePath)
 	if err != nil {
 		return nil, err
 	}
-	if len(files) == 0 {
+
+	var latestEpoch int64 = -1
+	var latest []string
+	for _, f := range files {
+		m := baseEpochPattern.FindStringSubmatch(filepath.Base(f))
+		if m == nil {
+			continue // ignore unrelated files in the base directory
+		}
+		epochNum, err := strconv.ParseInt(m[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		if epochNum > latestEpoch {
+			latestEpoch = epochNum
+			latest = latest[:0]
+		}
+		if epochNum == latestEpoch {
+			latest = append(latest, f)
+		}
+	}
+	if len(latest) == 0 {
 		return nil, nil
 	}
-	return readParquetRows(ctx, sink, files[len(files)-1])
+	sort.Strings(latest)
+
+	var rows []writer.Row
+	for _, f := range latest {
+		segmentRows, err := readParquetRows(ctx, sink, f)
+		if err != nil {
+			return nil, fmt.Errorf("read base segment %s: %w", f, err)
+		}
+		rows = append(rows, segmentRows...)
+	}
+	return rows, nil
 }
 
 func readParquetRows(ctx context.Context, sink ports.Sink, path string) ([]writer.Row, error) {

@@ -41,6 +41,10 @@ flush:
   interval_sec: 10                      # write delta Parquet every N seconds
   max_rows: 1000                        # or every N rows (whichever comes first)
 
+snapshot:
+  batch_rows: 50000                     # rows per bounded snapshot batch (init);
+                                        # memory use is capped at one batch per table
+
 state:
   type: sqlite                          # sqlite (default)
   path: .pgcdc/state.db                 # SQLite file path
@@ -121,6 +125,19 @@ catalog:
 |-------|----------|---------|-------------|
 | `interval_sec` | No | `10` | Flush delta Parquet every N seconds |
 | `max_rows` | No | `1000` | Or every N rows |
+
+### snapshot
+
+Controls how `init` reads the exported PostgreSQL snapshot. Tables are paged
+through by primary-key keyset pagination rather than loaded whole, so a very
+large table no longer requires holding every row in memory at once. Each batch
+becomes one numbered base segment; the manifest is only written after every
+segment of every table is in storage, so a crash mid-snapshot never leaves a
+half-published deployment behind.
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `batch_rows` | No | `50000` | Maximum rows buffered per snapshot read; also the maximum row count of one base segment |
 
 ### state
 

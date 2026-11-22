@@ -44,7 +44,13 @@ type Source interface {
 	CreateReplicationSlot(ctx context.Context, slotName string) (Snapshot, error)
 	ReleaseSnapshot(ctx context.Context)
 	CreatePublication(ctx context.Context, pubName string, tables []string) error
-	CopyTable(ctx context.Context, schema, table, snapshotName string) ([]map[string]any, []ColumnInfo, error)
+	// ScanTable pages through a table against the named exported snapshot in
+	// bounded keyset batches ordered by primary key. fn is invoked once per
+	// batch and must not retain the batch beyond the callback. Memory use
+	// stays proportional to the batch size rather than the table size. An
+	// empty table still yields exactly one empty batch so callers can
+	// materialise a base segment unconditionally.
+	ScanTable(ctx context.Context, schema, table, snapshotName string, primaryKeys []string, batchSize int, fn func(rows []map[string]any) error) error
 
 	// Streaming
 	Stream(ctx context.Context, slotName, pubName, startLSN string, events chan<- CDCEvent) error

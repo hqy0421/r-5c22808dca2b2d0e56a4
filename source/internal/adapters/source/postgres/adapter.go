@@ -62,16 +62,8 @@ func (a *Adapter) CreatePublication(ctx context.Context, pubName string, tables 
 	return a.conn.CreatePublication(ctx, pubName, tables)
 }
 
-func (a *Adapter) CopyTable(ctx context.Context, schema, table, snapshotName string) ([]map[string]any, []ports.ColumnInfo, error) {
-	rows, cols, err := a.conn.CopyTable(ctx, schema, table, snapshotName)
-	if err != nil {
-		return nil, nil, err
-	}
-	out := make([]ports.ColumnInfo, len(cols))
-	for i, c := range cols {
-		out[i] = ports.ColumnInfo{Name: c.Name, Type: c.Type, Nullable: c.Nullable, Position: c.Position}
-	}
-	return rows, out, nil
+func (a *Adapter) ScanTable(ctx context.Context, schema, table, snapshotName string, primaryKeys []string, batchSize int, fn func(rows []map[string]any) error) error {
+	return a.conn.ScanTable(ctx, schema, table, snapshotName, primaryKeys, batchSize, fn)
 }
 
 func (a *Adapter) Stream(ctx context.Context, slotName, pubName, startLSN string, events chan<- ports.CDCEvent) error {

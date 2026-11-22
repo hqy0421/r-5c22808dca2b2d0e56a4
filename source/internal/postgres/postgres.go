@@ -168,7 +168,7 @@ func (c *Conn) CreateReplicationSlot(ctx context.Context, slotName string) (lsn 
 }
 
 // ReleaseSnapshot closes the replication connection that holds the exported
-// snapshot open. Call this after all CopyTable calls are complete.
+// snapshot open. Call this after all ScanTable calls are complete.
 func (c *Conn) ReleaseSnapshot(ctx context.Context) {
 	if c.replConn != nil {
 		_ = c.replConn.Close(ctx)
@@ -206,63 +206,142 @@ func (c *Conn) CreatePublication(ctx context.Context, pubName string, tables []s
 	return nil
 }
 
-// CopyTable streams all rows from a table using COPY TO STDOUT.
-// Returns rows as []map[string]any and the column metadata.
-func (c *Conn) CopyTable(ctx context.Context, schema, table, snapshotName string) ([]map[string]any, []ColumnInfo, error) {
-	conn, err := c.pool.Acquire(ctx)
-	if err != nil {
-		return nil, nil, err
+// ScanTable pages through a table against the named exported snapshot in
+// bounded keyset batches ordered by primaryKey. Each batch runs in its own
+// REPEATABLE READ transaction that re-attaches the exported snapshot, so only
+// one batch of rows is held in memory at a time while every batch still sees
+// the same consistent point-in-time view.
+//
+// fn is invoked once per batch and must not retain the batch beyond the
+// callback (the next query reuses the same connection and the values are
+// only valid for the duration of the call). An empty table yields exactly
+// one invocation with an empty batch.
+func (c *Conn) ScanTable(ctx context.Context, schema, table, snapshotName string, primaryKey []string, batchSize int, fn func(rows []map[string]any) error) error {
+	if batchSize <= 0 {
+		return fmt.Errorf("scan %s.%s: batch size must be positive, got %d", schema, table, batchSize)
 	}
-	defer conn.Release()
-
-	// Use the exported snapshot for consistency
-	if snapshotName != "" {
-		if _, err := conn.Exec(ctx, "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
-			return nil, nil, fmt.Errorf("begin transaction: %w", err)
-		}
-		if _, err := conn.Exec(ctx, fmt.Sprintf("SET TRANSACTION SNAPSHOT '%s'", snapshotName)); err != nil {
-			return nil, nil, fmt.Errorf("set snapshot: %w", err)
-		}
-	}
-
-	// Get schema first
-	cols, err := c.GetTableSchema(ctx, schema, table)
-	if err != nil {
-		return nil, nil, err
+	if len(primaryKey) == 0 {
+		return fmt.Errorf("scan %s.%s: keyset batching requires a primary key", schema, table)
 	}
 
-	// Fetch rows
 	qualifiedTable := pgx.Identifier{schema, table}.Sanitize()
-	rows, err := conn.Query(ctx, fmt.Sprintf("SELECT * FROM %s", qualifiedTable))
-	if err != nil {
-		return nil, nil, fmt.Errorf("query table: %w", err)
+	orderCols := make([]string, len(primaryKey))
+	for i, col := range primaryKey {
+		orderCols[i] = pgx.Identifier{col}.Sanitize()
 	}
-	defer rows.Close()
+	orderClause := strings.Join(orderCols, ", ")
 
-	fieldDescs := rows.FieldDescriptions()
-	colNames := make([]string, len(fieldDescs))
-	for i, fd := range fieldDescs {
-		colNames[i] = fd.Name
+	// Row-value comparison gives composite-key keyset paging in one predicate:
+	// WHERE (k1, k2) > ($1, $2) ORDER BY k1, k2 LIMIT N.
+	baseQuery := fmt.Sprintf("SELECT * FROM %s", qualifiedTable)
+	if len(primaryKey) > 1 {
+		placeholders := make([]string, len(primaryKey))
+		for i := range primaryKey {
+			placeholders[i] = fmt.Sprintf("$%d", i+1)
+		}
+		baseQuery += fmt.Sprintf(" WHERE (%s) > (%s)", orderClause, strings.Join(placeholders, ", "))
+	} else {
+		baseQuery += fmt.Sprintf(" WHERE %s > $1", orderClause)
 	}
+	baseQuery += fmt.Sprintf(" ORDER BY %s LIMIT $%d", orderClause, len(primaryKey)+1)
 
-	var result []map[string]any
-	for rows.Next() {
-		values, err := rows.Values()
+	firstPageQuery := fmt.Sprintf("SELECT * FROM %s ORDER BY %s LIMIT $1", qualifiedTable, orderClause)
+
+	var cursor []any // PK values of the last row emitted; nil on the first page.
+	emitted := false
+	for {
+		conn, err := c.pool.Acquire(ctx)
 		if err != nil {
-			return nil, nil, fmt.Errorf("scan row: %w", err)
+			return err
 		}
-		row := make(map[string]any, len(colNames))
-		for i, name := range colNames {
-			row[name] = values[i]
+
+		if snapshotName != "" {
+			if _, err := conn.Exec(ctx, "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+				conn.Release()
+				return fmt.Errorf("begin transaction: %w", err)
+			}
+			if _, err := conn.Exec(ctx, fmt.Sprintf("SET TRANSACTION SNAPSHOT '%s'", snapshotName)); err != nil {
+				_, _ = conn.Exec(ctx, "ROLLBACK")
+				conn.Release()
+				return fmt.Errorf("set snapshot: %w", err)
+			}
 		}
-		result = append(result, row)
-	}
 
-	if snapshotName != "" {
-		_, _ = conn.Exec(ctx, "COMMIT")
-	}
+		var query string
+		var args []any
+		if cursor == nil {
+			query = firstPageQuery
+			args = []any{batchSize}
+		} else {
+			query = baseQuery
+			args = append(append(make([]any, 0, len(cursor)+1), cursor...), batchSize)
+		}
 
-	return result, cols, rows.Err()
+		rows, err := conn.Query(ctx, query, args...)
+		if err != nil {
+			if snapshotName != "" {
+				_, _ = conn.Exec(ctx, "ROLLBACK")
+			}
+			conn.Release()
+			return fmt.Errorf("query table: %w", err)
+		}
+
+		fieldDescs := rows.FieldDescriptions()
+		colNames := make([]string, len(fieldDescs))
+		for i, fd := range fieldDescs {
+			colNames[i] = fd.Name
+		}
+
+		batch := make([]map[string]any, 0, batchSize)
+		for rows.Next() {
+			values, err := rows.Values()
+			if err != nil {
+				rows.Close()
+				if snapshotName != "" {
+					_, _ = conn.Exec(ctx, "ROLLBACK")
+				}
+				conn.Release()
+				return fmt.Errorf("scan row: %w", err)
+			}
+			row := make(map[string]any, len(colNames))
+			for i, name := range colNames {
+				row[name] = values[i]
+			}
+			batch = append(batch, row)
+		}
+		queryErr := rows.Err()
+		rows.Close()
+		if snapshotName != "" {
+			if queryErr != nil {
+				_, _ = conn.Exec(ctx, "ROLLBACK")
+			} else if _, err := conn.Exec(ctx, "COMMIT"); err != nil {
+				queryErr = err
+			}
+		}
+		conn.Release()
+		if queryErr != nil {
+			return queryErr
+		}
+
+		// Guarantee a single empty batch for empty tables so the caller can
+		// still materialise a base segment.
+		if len(batch) == 0 && emitted {
+			return nil
+		}
+		if err := fn(batch); err != nil {
+			return err
+		}
+		emitted = true
+
+		if len(batch) < batchSize {
+			return nil
+		}
+		last := batch[len(batch)-1]
+		cursor = make([]any, len(primaryKey))
+		for i, col := range primaryKey {
+			cursor[i] = last[col]
+		}
+	}
 }
 
 // DropReplicationSlot drops a replication slot.

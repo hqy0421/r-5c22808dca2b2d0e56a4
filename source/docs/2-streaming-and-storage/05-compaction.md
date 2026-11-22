@@ -7,7 +7,9 @@
 ```
 pg-cdc compact
   For each active table:
-    1. Read current base Parquet into memory (keyed by PK)
+    1. Read the current base into memory (keyed by PK) — every segment of the
+       latest base epoch when init wrote the base in batches, or the single
+       base_<epoch>.parquet produced by an earlier compaction
     2. Read all delta files since base_epoch
     3. Apply changes in epoch order:
        - I (insert): add row
